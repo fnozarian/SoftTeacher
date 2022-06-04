@@ -77,10 +77,11 @@ class SoftTeacher(MultiSteamDetector):
         return self.compute_pseudo_label_loss(student_info, teacher_info)
 
     def compute_pseudo_label_loss(self, student_info, teacher_info):
+        # M=student/teacher transform mat
         M = self._get_trans_mat(
             teacher_info["transform_matrix"], student_info["transform_matrix"]
         )
-
+        # transform pseudo-labels back to match with original image gts and then applying student's transform
         pseudo_bboxes = self._transform_bbox(
             teacher_info["det_bboxes"],
             M,
@@ -88,6 +89,8 @@ class SoftTeacher(MultiSteamDetector):
         )
         pseudo_labels = teacher_info["det_labels"]
         loss = {}
+        # compute student's rpn loss based on final pseudo-labels of teacher (transformed using student's transform mat)
+        # proposal_list is also student's rpn proposals (student_info["rpn_out"] is the raw encoded network prediction)
         rpn_loss, proposal_list = self.rpn_loss(
             student_info["rpn_out"],
             pseudo_bboxes,
@@ -96,6 +99,7 @@ class SoftTeacher(MultiSteamDetector):
         )
         loss.update(rpn_loss)
         if proposal_list is not None:
+            # again, student_info["proposals"] is the student's rpn proposals
             student_info["proposals"] = proposal_list
         if self.train_cfg.use_teacher_proposal:
             proposals = self._transform_bbox(
@@ -144,6 +148,8 @@ class SoftTeacher(MultiSteamDetector):
         if self.student.with_rpn:
             gt_bboxes = []
             for bbox in pseudo_bboxes:
+                # In addition to the initial pseudo-label filtering, before rpn loss another filtering based on fg score
+                # (here classification score) of teacher is performed.
                 bbox, _, _ = filter_invalid(
                     bbox[:, :4],
                     score=bbox[
@@ -163,6 +169,7 @@ class SoftTeacher(MultiSteamDetector):
             proposal_cfg = self.student.train_cfg.get(
                 "rpn_proposal", self.student.test_cfg.rpn
             )
+            # proposal_list: student's rpn proposals
             proposal_list = self.student.rpn_head.get_bboxes(
                 *rpn_out, img_metas=img_metas, cfg=proposal_cfg
             )
@@ -193,6 +200,9 @@ class SoftTeacher(MultiSteamDetector):
         student_info=None,
         **kwargs,
     ):
+        # proposal_list: student's proposals from its rpn
+        # here proposals are filtered based on their "sem" cls score (>0.9).
+        # The same filtering performed when pseudo-labels were created by teacher but with a lower threshold (>0.5).
         gt_bboxes, gt_labels, _ = multi_apply(
             filter_invalid,
             [bbox[:, :4] for bbox in pseudo_bboxes],
@@ -203,6 +213,9 @@ class SoftTeacher(MultiSteamDetector):
         log_every_n(
             {"rcnn_cls_gt_num": sum([len(bbox) for bbox in gt_bboxes]) / len(gt_bboxes)}
         )
+        # sampling pos/neg proposals based on pseudo-labels
+        # Note: here the pseudo-label assigning and proposal sampling is performed
+        # after the intense filtering of pseudo-labels.
         sampling_results = self.get_sampling_result(
             img_metas,
             proposal_list,
@@ -211,7 +224,9 @@ class SoftTeacher(MultiSteamDetector):
         )
         selected_bboxes = [res.bboxes[:, :4] for res in sampling_results]
         rois = bbox2roi(selected_bboxes)
+        # bbox_results is (cls_score=cls_score, bbox_pred=bbox_pred, bbox_feats=bbox_feats)
         bbox_results = self.student.roi_head._bbox_forward(feat, rois)
+        # Calculate the ground truth for proposals in the single image according to the sampling results.
         bbox_targets = self.student.roi_head.bbox_head.get_targets(
             sampling_results, gt_bboxes, gt_labels, self.student.train_cfg.rcnn
         )
@@ -222,6 +237,8 @@ class SoftTeacher(MultiSteamDetector):
             [meta["img_shape"] for meta in teacher_img_metas],
         )
         with torch.no_grad():
+            # here, student's proposals are passed to teacher's roi head to estimate their bg score
+            # based on teacher_feat
             _, _scores = self.teacher.roi_head.simple_test_bboxes(
                 teacher_feat,
                 teacher_img_metas,
@@ -231,6 +248,8 @@ class SoftTeacher(MultiSteamDetector):
             )
             bg_score = torch.cat([_score[:, -1] for _score in _scores])
             assigned_label, _, _, _ = bbox_targets
+            # here the .num_classes is the considered as the bg class. Note classes are zero-based. So there are
+            # (.num_classes + 1) in total including bg.
             neg_inds = assigned_label == self.student.roi_head.bbox_head.num_classes
             bbox_targets[1][neg_inds] = bg_score[neg_inds].detach()
         loss = self.student.roi_head.bbox_head.loss(
@@ -329,6 +348,9 @@ class SoftTeacher(MultiSteamDetector):
         return [bt @ at.inverse() for bt, at in zip(b, a)]
 
     def extract_student_info(self, img, img_metas, proposals=None, **kwargs):
+        # extract the following infos:
+        # student_info["backbone_feature"]: features from the strongly augmented image
+        # if proposals passed, simply put it in student_info["proposals"] unchanged
         student_info = {}
         student_info["img"] = img
         feat = self.student.extract_feat(img)
@@ -345,9 +367,16 @@ class SoftTeacher(MultiSteamDetector):
         return student_info
 
     def extract_teacher_info(self, img, img_metas, proposals=None, **kwargs):
+        # extract the following infos:
+        # teacher_info["backbone_feature"]: features from the weakly augmented image
+        # teacher_info["proposals"]: rpn proposals
+        # teacher_info["det_bboxes"], teacher_info["det_labels"]: pseudo-labels or roi/rcnn preds of teacher with
+        # unc scores as last col in det_bboxes calculated by jittering every det_bbox and calc their std
         teacher_info = {}
         feat = self.teacher.extract_feat(img)
+        # extract teacher features with the weakly augmented image
         teacher_info["backbone_feature"] = feat
+        # extract teacher proposals from the weakly augmented image
         if proposals is None:
             proposal_cfg = self.teacher.train_cfg.get(
                 "rpn_proposal", self.teacher.test_cfg.rpn
@@ -358,8 +387,10 @@ class SoftTeacher(MultiSteamDetector):
             )
         else:
             proposal_list = proposals
+        # here "proposals" or proposal_list mean rpn proposals
         teacher_info["proposals"] = proposal_list
-
+        # pass teacher proposals to roi/rcnn head with simple test function.
+        # here proposal_list is overridden by roi/rcnn proposals
         proposal_list, proposal_label_list = self.teacher.roi_head.simple_test_bboxes(
             feat, img_metas, proposal_list, self.teacher.test_cfg.rcnn, rescale=False
         )
@@ -369,12 +400,15 @@ class SoftTeacher(MultiSteamDetector):
             p if p.shape[0] > 0 else p.new_zeros(0, 5) for p in proposal_list
         ]
         proposal_label_list = [p.to(feat[0].device) for p in proposal_label_list]
-        # filter invalid box roughly
+        # filter invalid box (rcnn preds) roughly
         if isinstance(self.train_cfg.pseudo_label_initial_score_thr, float):
             thr = self.train_cfg.pseudo_label_initial_score_thr
         else:
             # TODO: use dynamic threshold
             raise NotImplementedError("Dynamic Threshold is not implemented yet.")
+        # here the rois/rcnn proposals are filtered based on their sem cls scores,
+        # those with sem cls (including bg) score > 0.5 remain. This is perhaps required for computing unc
+        # scores.
         proposal_list, proposal_label_list, _ = list(
             zip(
                 *[
@@ -392,15 +426,21 @@ class SoftTeacher(MultiSteamDetector):
             )
         )
         det_bboxes = proposal_list
+        # compute uncertainty with aug, given filtered pseudo-labels (proposal_lists and proposal_label_list)
+        #  1. aug pseudo-labels by jitter
+        #  2. pass auged pseudo-labels to roi/rcnn head with simple_test_bboxes. Note: teacher's features are being used.
         reg_unc = self.compute_uncertainty_with_aug(
             feat, img_metas, proposal_list, proposal_label_list
         )
+        # append unc as the last col
         det_bboxes = [
             torch.cat([bbox, unc], dim=-1) for bbox, unc in zip(det_bboxes, reg_unc)
         ]
         det_labels = proposal_label_list
+        # det_bboxes and det_labels are final pseudo-labels with score and unc.
         teacher_info["det_bboxes"] = det_bboxes
         teacher_info["det_labels"] = det_labels
+        # one of the rotate, shear, shift, ... matrices in geo_utils.py
         teacher_info["transform_matrix"] = [
             torch.from_numpy(meta["transform_matrix"]).float().to(feat[0][0].device)
             for meta in img_metas
@@ -418,7 +458,7 @@ class SoftTeacher(MultiSteamDetector):
         auged_proposal_list = [
             auged.reshape(-1, auged.shape[-1]) for auged in auged_proposal_list
         ]
-
+        # pass auged pseudo-labels to roi/rcnn head with simple_test_bboxes. Note: teacher's features are being used.
         bboxes, _ = self.teacher.roi_head.simple_test_bboxes(
             feat,
             img_metas,
